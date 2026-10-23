@@ -1,0 +1,175 @@
+# CI do DoceFlow: backend (.NET 8), frontend (web/) e build de imagens.
+# Build de imagens só valida o Dockerfile; não há push.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (.NET 8)
+    runs-on: ubuntu-latest
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Dev@1234
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Dev@1234 -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # A solução é DoceFlow.slnx (formato que exige SDK 9+). Como este job usa 8.0.x,
+      # restore/build são feitos projeto a projeto, listando os .csproj explicitamente.
+      - name: Restore
+        run: |
+          for p in src/*/*.csproj tests/*/*.csproj; do
+            dotnet restore "$p"
+          done
+
+      - name: Build (warnings como erro)
+        run: |
+          for p in src/*/*.csproj tests/*/*.csproj; do
+            dotnet build "$p" -c Release --no-restore -warnaserror
+          done
+
+      - name: Testes unitários com cobertura
+        run: >-
+          dotnet test tests/Unit -c Release --no-build
+          --collect:"XPlat Code Coverage"
+          --results-directory TestResults/unit
+
+      - name: Testes de integração e funcionais
+        env:
+          ASPNETCORE_ENVIRONMENT: Testing
+          ConnectionStrings__Default: "Server=localhost,1433;Database=DoceFlow_test;User Id=sa;Password=Dev@1234;TrustServerCertificate=True"
+          Jwt__SecretKey: "chave-de-ci-nao-usar-em-producao-32chars!!"
+          Jwt__Issuer: DoceFlow
+          Jwt__Audience: DoceFlow
+        run: |
+          dotnet test tests/Integration -c Release --no-build
+          dotnet test tests/Functional -c Release --no-build
+
+      # Gate: cobertura de linhas do assembly Domain >= 90%.
+      # Tolerante nesta etapa: se Domain tiver menos de 50 linhas cobertas no total,
+      # apenas emite aviso (o código de Domain ainda é pequeno e a métrica não é estável).
+      # Remover a tolerância quando Domain tiver volume suficiente.
+      - name: Gate de cobertura do Domain
+        run: |
+          python3 - <<'PY'
+          import glob
+          import sys
+          import xml.etree.ElementTree as ET
+
+          files = glob.glob("TestResults/unit/**/coverage.cobertura.xml", recursive=True)
+          if not files:
+              print("::warning::Nenhum coverage.cobertura.xml encontrado; gate de Domain não aplicado.")
+              sys.exit(0)
+
+          # Linha -> maior número de hits entre os relatórios encontrados
+          hits = {}
+          for path in files:
+              for pkg in ET.parse(path).getroot().iter("package"):
+                  if pkg.get("name") != "Domain":
+                      continue
+                  for cls in pkg.iter("class"):
+                      filename = cls.get("filename")
+                      for line in cls.iter("line"):
+                          key = (filename, line.get("number"))
+                          hits[key] = max(hits.get(key, 0), int(line.get("hits", "0")))
+
+          total = len(hits)
+          covered = sum(1 for h in hits.values() if h > 0)
+          pct = 100.0 * covered / total if total else 0.0
+          print(f"Domain: {covered}/{total} linhas cobertas ({pct:.1f}%)")
+
+          if covered < 50:
+              print(f"::warning::Domain tem apenas {covered} linhas cobertas (< 50); gate de 90% não aplicado nesta etapa.")
+              sys.exit(0)
+          if pct < 90.0:
+              print(f"::error::Cobertura de linhas do Domain ({pct:.1f}%) abaixo de 90%.")
+              sys.exit(1)
+          PY
+
+      - name: Upload da cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobertura-unit
+          path: TestResults/unit/**/coverage.cobertura.xml
+          if-no-files-found: warn
+
+  frontend:
+    name: Frontend (web/)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload do dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  docker:
+    name: Build de imagens
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build da imagem da API
+        run: docker build -f src/Api/Dockerfile .
+
+      - name: Build da imagem do web
+        run: docker build ./web

@@ -13,3 +13,5 @@ dist/
 # Secrets
 *.env
 .env.*
+TestResults/
+.env

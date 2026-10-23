@@ -1,0 +1,18 @@
+# Requests executáveis da API DoceFlow (VS Code REST Client / JetBrains HTTP Client).
+# Subir a API antes: docker compose up -d db && dotnet run --project src/Api
+@baseUrl = http://localhost:8080
+
+### Liveness (processo está de pé)
+GET {{baseUrl}}/health/live
+
+### Readiness (API + dependências, ex.: SQL Server)
+GET {{baseUrl}}/health/ready
+
+### Health agregado
+GET {{baseUrl}}/health
+
+### Ping da API v1
+GET {{baseUrl}}/api/v1/sistema/ping
+
+### Swagger UI (abrir no navegador; comentado para não ser executado como request)
+# GET {{baseUrl}}/swagger/index.html
